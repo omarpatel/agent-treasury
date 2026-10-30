@@ -1,0 +1,219 @@
+// Agent token launches — the "financial layer" from the token spec. Each agent may launch exactly ONE
+// official token, permanently bound to its ID (one agent = one token; no replace, no reset). The token
+// is created on Pump.fun THROUGH THE AGENT'S OWN WALLET: the agent signs the create transaction, so
+// Pump.fun registers the agent as the creator and its creator rewards accrue directly to the agent's
+// wallet — that is the funding loop. Metadata is generated from the agent's existing identity (name,
+// purpose, public page). No coin is ever created unless an owner explicitly calls launchAgentToken AND
+// token launches are enabled on the deployment (config.token.launchEnabled).
+import { eq, isNotNull } from 'drizzle-orm';
+import { Connection, Keypair, PublicKey, TransactionInstruction, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
+import { ASSOCIATED_TOKEN_PROGRAM_ID, NATIVE_MINT, TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from '@solana/spl-token';
+import { type AgentTokenInfo, type TreasurySplit } from '@agent-treasury/shared';
+import { keypairFromSecret } from '../chain/keys.js';
+import { withAgentSecret } from '../chain/keystore.js';
+import type { CoreDeps } from '../core/interfaces.js';
+import { agents } from '../db/schema.js';
+import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
+import { addEvent } from './events.js';
+import { post } from './ledger.js';
+
+const PUMPPORTAL_LOCAL = 'https://pumpportal.fun/api/trade-local';   // builds an unsigned tx for our wallet (no api key)
+const PUMP_IPFS = 'https://pump.fun/api/ipfs';                        // hosts token image + metadata
+const TICKER_RE = /^[A-Z0-9]{2,10}$/;
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const CLAIM_GAS_KEEP_LAMPORTS = 6_000_000;   // ~0.006 SOL the agent keeps for its own gas
+const MIN_CLAIM_LAMPORTS = 2_000_000;        // don't bother converting a claim smaller than ~0.002 SOL
+const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
+const PUMP_FEES_PROGRAM = new PublicKey('pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ');
+const SYSTEM_PROGRAM = new PublicKey('11111111111111111111111111111111');
+const DISTRIBUTE_DISCRIMINATOR = Buffer.from('ffcb134ff444089f', 'hex');   // distribute_creator_fees_v2
+const PUMP_AMM_PROGRAM = new PublicKey('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA');
+const TRANSFER_DISCRIMINATOR = Buffer.from('01214eb921432c5c', 'hex');     // transfer_creator_fees_to_pump_v2
+
+export const pumpUrl = (mint: string): string => `https://pump.fun/${mint}`;
+const defaultTicker = (name: string): string => (name.replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 10) || 'AGENT');
+
+// Launch (or refuse to relaunch) the agent's one official token. Owner-only; permanent.
+export async function launchAgentToken(deps: CoreDeps, agentId: string, ownerId: string, tickerInput?: string): Promise<AgentTokenInfo> {
+  if (!deps.config.token.launchEnabled) throw badRequest('Token launches are not enabled on this deployment.');
+  const [agent] = await deps.db.select().from(agents).where(eq(agents.id, agentId)).limit(1);
+  if (!agent) throw notFound('Agent');
+  if (agent.ownerWallet !== ownerId) throw forbidden("Only the agent's creator can launch its token.");
+  if (agent.tokenMint) throw conflict('CONFLICT', 'This agent already has an official token — one agent, one token.');
+
+  const ticker = tickerInput?.trim().toUpperCase() || defaultTicker(agent.name);
+  if (!TICKER_RE.test(ticker)) throw badRequest('Ticker must be 2-10 letters or digits.');
+
+  const website = `${deps.config.publicUrl}/a/${agent.id}`;
+  const description = (agent.summary || agent.directive || `Autonomous agent ${agent.name}`).slice(0, 400);
+
+  // 1) Upload the token's image + metadata to IPFS (identity reused from the agent).
+  const form = new FormData();
+  // Pump.fun's IPFS endpoint requires an image file; agents have no avatar, so generate a stable one.
+  const avatarRes = await fetch(`https://api.dicebear.com/9.x/shapes/png?seed=${encodeURIComponent(agent.id)}&size=512`);
+  const avatar = new Uint8Array(await avatarRes.arrayBuffer());
+  form.append('file', new Blob([avatar], { type: 'image/png' }), `${ticker}.png`);
+  form.append('name', agent.name);
+  form.append('symbol', ticker);
+  form.append('description', description);
+  form.append('website', website);
+  form.append('showName', 'true');
+  const ipfs = await fetch(PUMP_IPFS, { method: 'POST', body: form });
+  if (!ipfs.ok) throw badRequest(`token metadata upload failed (${ipfs.status})`);
+  const meta = (await ipfs.json()) as { metadataUri?: string };
+  if (!meta.metadataUri) throw badRequest('IPFS returned no metadata URI');
+
+  // 2) Build the create tx for the AGENT's wallet, 3) sign with the agent + mint keys, 4) send it.
+  const mint = Keypair.generate();
+  const conn = new Connection(deps.config.chain.rpcUrl, 'confirmed');
+  await withAgentSecret(deps.db, deps.config.keyEncryptionKey, agentId, async (secret) => {
+    const agentKp = keypairFromSecret(secret);
+    const built = await fetch(PUMPPORTAL_LOCAL, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        publicKey: agentKp.publicKey.toBase58(), action: 'create',
+        tokenMetadata: { name: agent.name, symbol: ticker, uri: meta.metadataUri },
+        mint: mint.publicKey.toBase58(), denominatedInSol: 'true', amount: 0, slippage: 10, priorityFee: 0.0005, pool: 'pump',
+      }),
+    });
+    if (!built.ok) throw badRequest(`token create build failed (${built.status})`);
+    const tx = VersionedTransaction.deserialize(new Uint8Array(await built.arrayBuffer()));
+    tx.sign([mint, agentKp]);
+    const sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries: 5 });
+    await conn.confirmTransaction(sig, 'confirmed');
+    return sig;
+  });
+
+  const now = deps.clock.now();
+  const mintStr = mint.publicKey.toBase58();
+  await deps.db.update(agents)
+    .set({ tokenMint: mintStr, tokenTicker: ticker, tokenName: agent.name, tokenLaunchedAt: now })
+    .where(eq(agents.id, agentId));
+  await addEvent(deps, deps.db, { kind: 'update', agentId, agentName: agent.name, text: `${agent.name} launched its official token $${ticker}`, meta: { mint: mintStr, ticker } });
+  deps.log.info({ agentId, mint: mintStr, ticker }, 'agent token launched');
+  return { mint: mintStr, name: agent.name, ticker, launchedAt: now.toISOString(), pumpUrl: pumpUrl(mintStr) };
+}
+
+// --- Pump.fun creator-fee sharing, built directly (no SDK, so it never touches the payments SDK's
+// Anchor version). Modern coins route creator fees through a `sharing_config` PDA that splits them
+// among shareholders; the permissionless `distribute_creator_fees_v2` pays the creator vault out to
+// every shareholder. Accounts + discriminator verified byte-for-byte against @pump-fun/pump-sdk. ---
+const pumpPda = (seeds: Array<Buffer | Uint8Array>, program = PUMP_PROGRAM): PublicKey =>
+  PublicKey.findProgramAddressSync(seeds, program)[0];
+
+// SharingConfig layout: 8-byte anchor discriminator, bump(1), version(1), status(1), mint(32),
+// admin(32), adminRevoked(1), then a Vec<{ address: Pubkey(32), shareBps: u16 }> (u32 length prefix).
+function readShareholders(data: Buffer): PublicKey[] {
+  let o = 8 + 1 + 1 + 1 + 32 + 32 + 1;
+  const count = data.readUInt32LE(o); o += 4;
+  const out: PublicKey[] = [];
+  for (let i = 0; i < count && i < 10; i++) { out.push(new PublicKey(data.subarray(o, o + 32))); o += 34; }
+  return out;
+}
+
+const wsolAta = (owner: PublicKey): PublicKey =>
+  getAssociatedTokenAddressSync(NATIVE_MINT, owner, true, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
+
+// The claim for a fee-sharing, SOL-paired coin, or null when the coin has no sharing_config. Once a
+// coin graduates its creator fees accrue on the PumpSwap AMM, so transfer_creator_fees_to_pump_v2
+// first sweeps those into the bonding curve's creator vault (skipped while the AMM vault does not
+// exist yet), then distribute_creator_fees_v2 pays the vault out to every shareholder. Both are
+// permissionless; the agent just pays gas. Account layouts verified byte-for-byte against the SDK.
+async function feeSharingClaimIxs(conn: Connection, mint: PublicKey, payer: PublicKey): Promise<TransactionInstruction[] | null> {
+  const sharingConfig = pumpPda([Buffer.from('sharing-config'), mint.toBuffer()], PUMP_FEES_PROGRAM);
+  const info = await conn.getAccountInfo(sharingConfig, 'confirmed');
+  if (!info) return null;
+  const shareholders = readShareholders(info.data);
+  const creatorVault = pumpPda([Buffer.from('creator-vault'), sharingConfig.toBuffer()]);
+  const k = (pubkey: PublicKey, isWritable: boolean, isSigner = false) => ({ pubkey, isSigner, isWritable });
+  const ixs: TransactionInstruction[] = [];
+
+  const ammVaultAuthority = pumpPda([Buffer.from('creator_vault'), sharingConfig.toBuffer()], PUMP_AMM_PROGRAM);
+  if (await conn.getAccountInfo(wsolAta(ammVaultAuthority), 'confirmed')) {
+    ixs.push(new TransactionInstruction({ programId: PUMP_AMM_PROGRAM, data: TRANSFER_DISCRIMINATOR, keys: [
+      k(payer, true, true), k(NATIVE_MINT, false), k(TOKEN_PROGRAM_ID, false), k(SYSTEM_PROGRAM, false), k(ASSOCIATED_TOKEN_PROGRAM_ID, false),
+      k(sharingConfig, false), k(ammVaultAuthority, true), k(wsolAta(ammVaultAuthority), true), k(creatorVault, true), k(wsolAta(creatorVault), true),
+      k(pumpPda([Buffer.from('__event_authority')], PUMP_AMM_PROGRAM), false), k(PUMP_AMM_PROGRAM, false),
+    ] }));
+  }
+  ixs.push(new TransactionInstruction({ programId: PUMP_PROGRAM, data: Buffer.concat([DISTRIBUTE_DISCRIMINATOR, Buffer.from([1])]), keys: [
+    k(payer, true, true), k(mint, false), k(pumpPda([Buffer.from('bonding-curve'), mint.toBuffer()]), false), k(sharingConfig, false),
+    k(creatorVault, true), k(SYSTEM_PROGRAM, false), k(pumpPda([Buffer.from('__event_authority')]), false), k(PUMP_PROGRAM, false),
+    k(wsolAta(creatorVault), true), k(NATIVE_MINT, false), k(TOKEN_PROGRAM_ID, false), k(ASSOCIATED_TOKEN_PROGRAM_ID, false),
+    ...shareholders.map((s) => k(s, true)),
+  ] }));
+  return ixs;
+}
+
+// Pull the agent's pending Pump.fun creator fees into its OWN wallet, signed by the agent. Fee-sharing
+// coins use transfer + distribute (above); legacy single-recipient coins fall back to collect_creator_fee.
+async function claimPumpFees(conn: Connection, agentKp: Keypair, mintStr: string): Promise<void> {
+  const ixs = await feeSharingClaimIxs(conn, new PublicKey(mintStr), agentKp.publicKey);
+  if (ixs) {
+    const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash('confirmed');
+    const msg = new TransactionMessage({ payerKey: agentKp.publicKey, recentBlockhash: blockhash, instructions: ixs }).compileToV0Message();
+    const tx = new VersionedTransaction(msg);
+    tx.sign([agentKp]);
+    const sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries: 3 });
+    await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
+    return;
+  }
+  const resp = await fetch(PUMPPORTAL_LOCAL, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ publicKey: agentKp.publicKey.toBase58(), action: 'collectCreatorFee', priorityFee: 0.0005 }),
+  });
+  if (!resp.ok) throw new Error(`creator-fee claim build failed (${resp.status})`);
+  const tx = VersionedTransaction.deserialize(new Uint8Array(await resp.arrayBuffer()));
+  tx.sign([agentKp]);
+  const sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries: 3 });
+  await conn.confirmTransaction(sig, 'confirmed');
+}
+
+// Claims the agent's accumulated Pump.fun creator fees (paid in SOL) into its own wallet, converts the
+// proceeds to USDC and books them into the treasury as `creator_reward`. Signed by the agent (the
+// creator). Returns how much USDC was booked. Run by the periodic `creator_fees` job.
+export async function claimCreatorFees(deps: CoreDeps, agentId: string): Promise<{ ok: boolean; bookedMicro: number }> {
+  const [agent] = await deps.db.select().from(agents).where(eq(agents.id, agentId)).limit(1);
+  if (!agent?.tokenMint) return { ok: false, bookedMicro: 0 };
+  const conn = new Connection(deps.config.chain.rpcUrl, 'confirmed');
+  try {
+    await withAgentSecret(deps.db, deps.config.keyEncryptionKey, agentId, (secret) =>
+      claimPumpFees(conn, keypairFromSecret(secret), agent.tokenMint!));
+    // Fees land as SOL in the agent's OWN wallet. Convert everything above the gas reserve to USDC and
+    // book it as the agent's revenue, so its treasury reflects the fees its token earned.
+    const solAfter = await deps.chain.getSolBalance(agent.walletPubkey);
+    const swappable = Math.max(0, solAfter - CLAIM_GAS_KEEP_LAMPORTS);
+    if (swappable < MIN_CLAIM_LAMPORTS) return { ok: true, bookedMicro: 0 };
+    const { outAmount } = await withAgentSecret(deps.db, deps.config.keyEncryptionKey, agentId, (secret) =>
+      deps.chain.swap(secret, SOL_MINT, deps.chain.usdcMint, swappable, deps.config.trading.slippageBps));
+    if (outAmount > 0) {
+      await post(deps, deps.db, { agentId, kind: 'creator_reward', amountMicro: outAmount, memo: 'creator fees claimed' });
+      await addEvent(deps, deps.db, { kind: 'revenue', agentId, agentName: agent.name, text: `${agent.name} claimed $${(outAmount / 1e6).toFixed(2)} in creator fees from $${agent.tokenTicker ?? ''}`, amountMicro: outAmount });
+    }
+    return { ok: true, bookedMicro: outAmount };
+  } catch (e) {
+    deps.log.warn({ agentId, err: e instanceof Error ? e.message : String(e) }, 'creator-fee claim failed');
+    return { ok: false, bookedMicro: 0 };
+  }
+}
+
+// The periodic job: claim + book creator fees for every tokenized agent. No-op while no agent has a token.
+export async function claimAllCreatorFees(deps: CoreDeps): Promise<void> {
+  const rows = await deps.db.select({ id: agents.id }).from(agents).where(isNotNull(agents.tokenMint));
+  for (const { id } of rows) {
+    if (deps.clock) { /* serialise: one claim at a time keeps RPC + gas sane */ }
+    await claimCreatorFees(deps, id);
+  }
+}
+
+// Treasury breakdown for the dashboard — REAL numbers, not a cosmetic split: the reserve is the liquid
+// floor the trading engine will never spend below, and the rest is deployable capital the agent can put
+// to work (trades, tools, ops). `open` is the marked-to-market value of positions it currently holds.
+export function treasurySplit(treasuryMicro: number, minReserveMicro: number, openPositionsMicro = 0): TreasurySplit {
+  const reserveMicro = Math.min(treasuryMicro, minReserveMicro);
+  const deployableMicro = Math.max(0, treasuryMicro - reserveMicro);
+  return { reserveMicro, deployableMicro, openPositionsMicro };
+}
+
+export const tokenInfoOf = (a: { tokenMint: string | null; tokenName: string | null; tokenTicker: string | null; tokenLaunchedAt: Date | null }): AgentTokenInfo | null =>
+  a.tokenMint ? { mint: a.tokenMint, name: a.tokenName ?? '', ticker: a.tokenTicker ?? '', launchedAt: a.tokenLaunchedAt?.toISOString() ?? '', pumpUrl: pumpUrl(a.tokenMint) } : null;

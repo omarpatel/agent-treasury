@@ -1,0 +1,28 @@
+{
+  "name": "agent-treasury",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@10.13.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "pnpm -r --parallel --if-present dev",
+    "demo": "pnpm --filter @agent-treasury/api demo",
+    "doctor": "pnpm --filter @agent-treasury/api --silent run doctor",
+    "ready": "pnpm --filter @agent-treasury/api --silent run doctor",
+    "build": "pnpm -r --if-present build",
+    "test": "pnpm -r --if-present test",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "lint": "pnpm -r --if-present lint",
+    "db:push": "pnpm --filter @agent-treasury/api db:push",
+    "db:generate": "pnpm --filter @agent-treasury/api db:generate",
+    "db:migrate": "pnpm --filter @agent-treasury/api db:migrate"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}
